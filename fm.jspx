@@ -1,0 +1,750 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<jsp:root xmlns:jsp="http://java.sun.com/JSP/Page" version="2.3">
+<jsp:directive.page contentType="text/html; charset=UTF-8" pageEncoding="UTF-8" trimDirectiveWhitespaces="true"/>
+<jsp:directive.page import="java.io.*"/>
+<jsp:directive.page import="java.nio.file.*"/>
+<jsp:directive.page import="java.nio.file.attribute.*"/>
+<jsp:directive.page import="java.nio.charset.StandardCharsets"/>
+<jsp:directive.page import="java.security.*"/>
+<jsp:directive.page import="javax.crypto.*"/>
+<jsp:directive.page import="javax.crypto.spec.*"/>
+<jsp:directive.page import="java.util.*"/>
+<jsp:directive.page import="java.util.stream.*"/>
+<jsp:directive.page import="java.net.*"/>
+<jsp:directive.page import="java.text.SimpleDateFormat"/>
+<jsp:declaration><![CDATA[
+// =====================================================================
+// fm.jspx — single-file manager. Root = the directory this file sits in.
+// To change the password: replace PW_HASH (format pbkdf2$iter$salt$hash).
+// All navigation/actions use POST body params (no query strings) so the
+// page works even when the browser/proxy strips ?query parameters.
+// =====================================================================
+private static final String PW_HASH = "pbkdf2$210000$uRlNoAOJCeubbhIS2mLcVQ==$sSoSZrng4qVfaCP7wSqc6kFipYAK85oMEDY7Zon82tI=";
+private static final long MAX_UPLOAD = 200L * 1024 * 1024;
+private static final long MAX_POST   = 210L * 1024 * 1024;
+private static final long MAX_TEXT   = 1024L * 1024;
+private static final int  THROTTLE_LIMIT  = 5;
+private static final long THROTTLE_WINDOW = 5 * 60 * 1000L;
+private static final long THROTTLE_LOCK   = 5 * 60 * 1000L;
+
+private static final Map<String, long[]> THROTTLE = new HashMap<String, long[]>();
+
+private static boolean pbkdf2Verify(String pw, String stored) {
+    try {
+        String[] p = stored.split("\\$");
+        if (p.length != 4 || !"pbkdf2".equals(p[0])) return false;
+        int iter = Integer.parseInt(p[1]);
+        byte[] salt = Base64.getDecoder().decode(p[2]);
+        byte[] expected = Base64.getDecoder().decode(p[3]);
+        PBEKeySpec spec = new PBEKeySpec(pw.toCharArray(), salt, iter, 256);
+        byte[] got = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+        return MessageDigest.isEqual(expected, got);
+    } catch (Exception e) { return false; }
+}
+
+private static synchronized boolean throttled(String ip) {
+    long[] e = THROTTLE.get(ip);
+    long now = System.currentTimeMillis();
+    if (e == null) return false;
+    if (e[2] > now) return true;
+    if (now - e[1] > THROTTLE_WINDOW) { THROTTLE.remove(ip); return false; }
+    return e[0] >= THROTTLE_LIMIT;
+}
+
+private static synchronized void failThrottle(String ip) {
+    long now = System.currentTimeMillis();
+    long[] e = THROTTLE.get(ip);
+    if (e == null || now - e[1] > THROTTLE_WINDOW) { e = new long[]{0, now, 0}; THROTTLE.put(ip, e); }
+    e[0]++;
+    if (e[0] >= THROTTLE_LIMIT) e[2] = now + THROTTLE_LOCK;
+}
+
+private static synchronized void clearThrottle(String ip) { THROTTLE.remove(ip); }
+
+private static String randomHex(int n) {
+    byte[] b = new byte[n / 2];
+    new SecureRandom().nextBytes(b);
+    StringBuilder sb = new StringBuilder();
+    for (byte x : b) sb.append(String.format("%02x", x));
+    return sb.toString();
+}
+
+private static String esc(String s) {
+    if (s == null) return "";
+    StringBuilder sb = new StringBuilder(s.length());
+    for (char c : s.toCharArray()) {
+        switch (c) {
+            case '&': sb.append("&amp;"); break;
+            case '<': sb.append("&lt;"); break;
+            case '>': sb.append("&gt;"); break;
+            case '"': sb.append("&quot;"); break;
+            case '\'': sb.append("&#39;"); break;
+            default: sb.append(c);
+        }
+    }
+    return sb.toString();
+}
+
+private static String escJs(String s) {
+    if (s == null) return "";
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("'", "\\'")
+            .replace("\r", "").replace("\n", "\\n");
+}
+
+private static String enc(String s) {
+    try { return URLEncoder.encode(s, "UTF-8").replace("+", "%20"); }
+    catch (Exception e) { return ""; }
+}
+
+private static Map<String, String> parseQuery(String q) {
+    Map<String, String> m = new HashMap<String, String>();
+    if (q == null) return m;
+    for (String kv : q.split("&")) {
+        int i = kv.indexOf('=');
+        try {
+            if (i < 0) m.put(URLDecoder.decode(kv, "UTF-8"), "");
+            else m.put(URLDecoder.decode(kv.substring(0, i), "UTF-8"),
+                       URLDecoder.decode(kv.substring(i + 1), "UTF-8"));
+        } catch (Exception ignored) {}
+    }
+    return m;
+}
+
+private static Path resolve(Path root, String rel) throws IOException {
+    if (rel == null || rel.trim().isEmpty()) return root;
+    Path p = root.resolve(rel.replace('\\', '/')).normalize();
+    if (!p.startsWith(root)) throw new IOException("Outside root");
+    if (Files.exists(p)) {
+        p = p.toRealPath();
+        if (!p.startsWith(root)) throw new IOException("Symlink escapes root");
+    } else {
+        Path parent = p.getParent();
+        if (parent == null || !Files.exists(parent)) throw new IOException("Parent does not exist");
+        parent = parent.toRealPath();
+        if (!parent.startsWith(root)) throw new IOException("Symlink escapes root");
+    }
+    return p;
+}
+
+private static String parentRel(String rel) {
+    if (rel == null || rel.isEmpty()) return "";
+    int i = rel.lastIndexOf('/');
+    return i < 0 ? "" : rel.substring(0, i);
+}
+
+private static long sizeOf(Path p) {
+    try { return Files.isDirectory(p) ? -1L : Files.size(p); } catch (Exception e) { return -1L; }
+}
+
+private static long mtimeOf(Path p) {
+    try { return Files.getLastModifiedTime(p).toMillis(); } catch (Exception e) { return 0L; }
+}
+
+private static String fmtSize(long n) {
+    if (n < 0) return "";
+    double v = n;
+    String[] u = {"B", "KB", "MB", "GB", "TB"};
+    int i = 0;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    if (i == 0) return n + " B";
+    return String.format(java.util.Locale.ROOT, "%.1f %s", v, u[i]);
+}
+
+private static String fmtDate(long ms) {
+    if (ms <= 0) return "";
+    return new SimpleDateFormat("yyyy-MM-dd HH:mm").format(new Date(ms));
+}
+
+private static String perms(Path p) {
+    try {
+        return PosixFilePermissions.toString(Files.getPosixFilePermissions(p));
+    } catch (Exception e) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(Files.isDirectory(p) ? 'd' : '-');
+        sb.append(Files.isReadable(p) ? 'r' : '-');
+        sb.append(Files.isWritable(p) ? 'w' : '-');
+        sb.append(Files.isExecutable(p) ? 'x' : '-');
+        return sb.toString();
+    }
+}
+
+private static void deleteRecursive(Path p) throws IOException {
+    if (Files.isDirectory(p)) {
+        try (Stream<Path> walk = Files.walk(p)) {
+            Iterator<Path> it = walk.sorted(Comparator.reverseOrder()).iterator();
+            while (it.hasNext()) Files.deleteIfExists(it.next());
+        }
+    } else {
+        Files.deleteIfExists(p);
+    }
+}
+
+private static void audit(javax.servlet.http.HttpServletRequest req, String action, String target, String result) {
+    try {
+        String base = System.getProperty("catalina.base");
+        if (base == null) return;
+        String line = System.currentTimeMillis() + " | " + req.getRemoteAddr() + " | " + action
+                    + " | " + target + " | " + result + "\n";
+        Files.write(Paths.get(base, "logs", "fm-audit.log").toAbsolutePath(),
+                    line.getBytes(StandardCharsets.UTF_8),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    } catch (Exception ignored) {}
+}
+
+private static class Part { String name; String filename; byte[] data; }
+
+private static int indexOf(byte[] hay, byte[] needle, int from) {
+    outer:
+    for (int i = from; i <= hay.length - needle.length; i++) {
+        for (int j = 0; j < needle.length; j++) {
+            if (hay[i + j] != needle[j]) continue outer;
+        }
+        return i;
+    }
+    return -1;
+}
+
+private static byte[] readBody(javax.servlet.http.HttpServletRequest req, long cap) throws IOException {
+    ByteArrayOutputStream bos = new ByteArrayOutputStream();
+    InputStream in = req.getInputStream();
+    byte[] buf = new byte[65536];
+    long total = 0;
+    int n;
+    while ((n = in.read(buf)) != -1) {
+        total += n;
+        if (total > cap) throw new IOException("Request too large");
+        bos.write(buf, 0, n);
+    }
+    return bos.toByteArray();
+}
+
+private static String unq(String s) {
+    if (s == null) return s;
+    s = s.trim();
+    if (s.length() >= 2 && s.charAt(0) == '"' && s.charAt(s.length() - 1) == '"') {
+        return s.substring(1, s.length() - 1);
+    }
+    return s;
+}
+
+private static List<Part> parseMultipart(byte[] body, String ct) throws IOException {
+    String boundary = null;
+    for (String s : ct.split(";")) {
+        s = s.trim();
+        if (s.startsWith("boundary=")) boundary = unq(s.substring(9));
+    }
+    if (boundary == null) throw new IOException("No multipart boundary");
+    byte[] b = ("--" + boundary).getBytes(StandardCharsets.ISO_8859_1);
+    List<Part> parts = new ArrayList<Part>();
+    int idx = indexOf(body, b, 0);
+    while (idx >= 0) {
+        int next = indexOf(body, b, idx + b.length);
+        if (next < 0) break;
+        int start = idx + b.length;
+        if (start + 1 < body.length && body[start] == '\r' && body[start + 1] == '\n') start += 2;
+        int end = next - 2;
+        if (end < start) end = start;
+        byte[] part = Arrays.copyOfRange(body, start, end);
+        int hdrEnd = indexOf(part, "\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1), 0);
+        if (hdrEnd >= 0) {
+            String headers = new String(part, 0, hdrEnd, StandardCharsets.ISO_8859_1);
+            String name = null, filename = null;
+            for (String h : headers.split("\r\n")) {
+                if (h.toLowerCase().startsWith("content-disposition:")) {
+                    for (String kv : h.substring(h.indexOf(':') + 1).split(";")) {
+                        kv = kv.trim();
+                        if (kv.startsWith("name=")) name = unq(kv.substring(5));
+                        else if (kv.startsWith("filename=")) filename = unq(kv.substring(9));
+                    }
+                }
+            }
+            Part p2 = new Part();
+            p2.name = name;
+            p2.filename = filename;
+            p2.data = Arrays.copyOfRange(part, hdrEnd + 4, part.length);
+            parts.add(p2);
+        }
+        idx = next;
+    }
+    return parts;
+}
+]]></jsp:declaration>
+<jsp:scriptlet><![CDATA[
+response.setHeader("X-Content-Type-Options", "nosniff");
+response.setHeader("X-Frame-Options", "DENY");
+response.setHeader("Referrer-Policy", "same-origin");
+response.setHeader("Cache-Control", "no-store");
+
+javax.servlet.http.HttpSession ses = request.getSession(true);
+String csrf = (String) ses.getAttribute("fm_csrf");
+if (csrf == null) { csrf = randomHex(32); ses.setAttribute("fm_csrf", csrf); }
+boolean authed = "1".equals(ses.getAttribute("fm_auth"));
+
+String method = request.getMethod();
+String ct = request.getContentType();
+boolean isMultipart = "POST".equals(method) && ct != null
+        && ct.toLowerCase().startsWith("multipart/form-data");
+
+String uri = request.getRequestURI();
+Path root = Paths.get(application.getRealPath("/")).toRealPath();
+
+String navPath = null, navSort = null, navView = null;
+
+if ("GET".equals(method)) {
+    navPath = request.getParameter("path");
+    navSort = request.getParameter("sort");
+    navView = request.getParameter("view");
+}
+
+String flashMsg = (String) ses.getAttribute("fm_flash_msg");
+String flashErr = (String) ses.getAttribute("fm_flash_err");
+if (flashMsg != null) ses.removeAttribute("fm_flash_msg");
+if (flashErr != null) ses.removeAttribute("fm_flash_err");
+
+boolean renderNow = false;
+
+if ("POST".equals(method)) {
+    String action = null, token = null, dest = null;
+    if (isMultipart) {
+        try {
+            byte[] body = readBody(request, MAX_POST);
+            List<Part> parts = parseMultipart(body, ct);
+            Map<String, String> q = parseQuery(request.getQueryString());
+            action = "upload";
+            token = q.get("fm_csrf");
+            dest = q.get("dest");
+            for (Part part : parts) {
+                if ("fm_csrf".equals(part.name)) token = new String(part.data, StandardCharsets.UTF_8).trim();
+                else if ("dest".equals(part.name)) dest = new String(part.data, StandardCharsets.UTF_8).trim();
+            }
+            ses.setAttribute("fm_up_parts", parts);
+            ses.setAttribute("fm_up_dest", dest);
+        } catch (Exception e) {
+            flashErr = e.getMessage();
+            response.sendRedirect(uri);
+            return;
+        }
+    } else {
+        action = request.getParameter("action");
+        token = request.getParameter("fm_csrf");
+    }
+
+    if (token == null || !token.equals(csrf)) {
+        audit(request, "DENIED_CSRF", "", "bad token");
+        flashErr = "Invalid CSRF token.";
+        if ("login".equals(action)) {
+            response.sendRedirect(uri);
+            return;
+        }
+        renderNow = true;
+    } else if ("login".equals(action)) {
+        String ip = request.getRemoteAddr();
+        if (throttled(ip)) {
+            flashErr = "Too many attempts — wait 5 minutes.";
+        } else {
+            String pw = request.getParameter("password");
+            if (pw != null && pbkdf2Verify(pw, PW_HASH)) {
+                clearThrottle(ip);
+                request.changeSessionId();
+                ses.setAttribute("fm_auth", "1");
+                flashMsg = "Logged in.";
+                audit(request, "LOGIN_OK", "", "ok");
+            } else {
+                failThrottle(ip);
+                audit(request, "LOGIN_FAILED", "", "bad password");
+                flashErr = "Invalid password.";
+            }
+        }
+        response.sendRedirect(uri);
+        return;
+    } else if (!authed) {
+        if ("navigate".equals(action) || "download".equals(action)) {
+            response.sendRedirect(uri);
+            return;
+        }
+        response.sendError(401, "Not authenticated");
+        return;
+    } else {
+        try {
+            if ("logout".equals(action)) {
+                audit(request, "LOGOUT", "", "ok");
+                ses.invalidate();
+                response.sendRedirect(uri);
+                return;
+            } else if ("navigate".equals(action)) {
+                navPath = request.getParameter("path");
+                navSort = request.getParameter("sort");
+                if (navPath != null && !navPath.isEmpty()) {
+                    try {
+                        Path t = resolve(root, navPath);
+                        if (Files.isRegularFile(t)) {
+                            navView = root.relativize(t).toString().replace('\\', '/');
+                            Path parent = t.getParent();
+                            navPath = parent == null ? "" : root.relativize(parent).toString().replace('\\', '/');
+                        } else if (Files.isDirectory(t)) {
+                            navPath = root.relativize(t).toString().replace('\\', '/');
+                        }
+                    } catch (Exception e) { /* render will show the error */ }
+                }
+                renderNow = true;
+            } else if ("download".equals(action)) {
+                String dl = request.getParameter("path");
+                try {
+                    Path p = resolve(root, dl);
+                    if (!Files.isRegularFile(p)) { response.sendError(404, "Not a file"); return; }
+                    response.reset();
+                    response.setContentType("application/octet-stream");
+                    String fname = p.getFileName().toString();
+                    response.setHeader("Content-Disposition",
+                        "attachment; filename*=UTF-8''" + enc(fname));
+                    response.setContentLengthLong(Files.size(p));
+                    OutputStream os = response.getOutputStream();
+                    Files.copy(p, os);
+                    os.flush();
+                    audit(request, "DOWNLOAD", dl, "ok");
+                    return;
+                } catch (Exception e) {
+                    flashErr = e.getMessage();
+                    response.sendRedirect(uri);
+                    return;
+                }
+            } else if ("mkdir".equals(action)) {
+                String rel = request.getParameter("path");
+                Path p = resolve(root, rel);
+                Files.createDirectories(p);
+                audit(request, "MKDIR", rel, "ok");
+                flashMsg = "Folder created.";
+                navPath = parentRel(rel);
+                renderNow = true;
+            } else if ("rename".equals(action)) {
+                String fromRel = request.getParameter("path");
+                String toRel = request.getParameter("to");
+                Path from = resolve(root, fromRel);
+                Path to = resolve(root, toRel);
+                if (Files.exists(to)) throw new IOException("Target already exists");
+                Files.move(from, to, StandardCopyOption.ATOMIC_MOVE);
+                audit(request, "RENAME", fromRel + " -> " + toRel, "ok");
+                flashMsg = "Renamed.";
+                navPath = parentRel(toRel);
+                renderNow = true;
+            } else if ("delete".equals(action)) {
+                String[] paths = request.getParameterValues("path");
+                if (paths == null) paths = new String[]{ request.getParameter("path") };
+                int n = 0;
+                String first = "";
+                for (String s : paths) {
+                    Path p = resolve(root, s);
+                    if (p.equals(root)) throw new IOException("Cannot delete root");
+                    deleteRecursive(p);
+                    if (first.isEmpty()) first = s;
+                    n++;
+                }
+                audit(request, "DELETE", n + " items", "ok");
+                flashMsg = n + " deleted.";
+                navPath = parentRel(first);
+                renderNow = true;
+            } else if ("save".equals(action)) {
+                String rel = request.getParameter("path");
+                Path p = resolve(root, rel);
+                if (!Files.isRegularFile(p)) throw new IOException("Not a file");
+                String content = request.getParameter("content");
+                if (content != null && content.getBytes(StandardCharsets.UTF_8).length > MAX_TEXT) {
+                    throw new IOException("Content too large (max 1 MB)");
+                }
+                Path tmp = Files.createTempFile(p.getParent(), ".fm-", ".tmp");
+                try {
+                    Files.write(tmp, content == null ? new byte[0] : content.getBytes(StandardCharsets.UTF_8));
+                    Files.move(tmp, p, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                } finally { Files.deleteIfExists(tmp); }
+                audit(request, "SAVE", rel, "ok");
+                flashMsg = "Saved.";
+                navPath = parentRel(rel);
+                navView = rel;
+                renderNow = true;
+            } else if ("upload".equals(action)) {
+                List<Part> parts = (List<Part>) ses.getAttribute("fm_up_parts");
+                ses.removeAttribute("fm_up_parts");
+                dest = (String) ses.getAttribute("fm_up_dest");
+                ses.removeAttribute("fm_up_dest");
+                if (parts == null) throw new IOException("No upload data");
+                Path dir = resolve(root, dest == null ? "" : dest);
+                if (!Files.isDirectory(dir)) throw new IOException("Destination is not a directory");
+                int n = 0;
+                for (Part part : parts) {
+                    if (part.filename == null || part.filename.isEmpty()) continue;
+                    if (part.data.length > MAX_UPLOAD) throw new IOException("File too large: " + part.filename);
+                    String name = Paths.get(part.filename).getFileName().toString();
+                    if (name.isEmpty() || ".".equals(name) || "..".equals(name)) continue;
+                    Path target = dir.resolve(name);
+                    if (Files.exists(target)) {
+                        int dot = name.lastIndexOf('.');
+                        String stem = dot > 0 ? name.substring(0, dot) : name;
+                        String ext = dot > 0 ? name.substring(dot) : "";
+                        int i = 1;
+                        do { target = dir.resolve(stem + "(" + i + ")" + ext); i++; } while (Files.exists(target));
+                    }
+                    Files.write(target, part.data);
+                    n++;
+                }
+                audit(request, "UPLOAD", dest + " (" + n + " files)", "ok");
+                flashMsg = n + " file(s) uploaded.";
+                navPath = dest == null ? "" : dest;
+                renderNow = true;
+            } else {
+                flashErr = "Unknown action.";
+                renderNow = true;
+            }
+        } catch (Exception e) {
+            audit(request, action == null ? "POST" : action.toUpperCase(), "", "error: " + e.getMessage());
+            flashErr = e.getMessage();
+            renderNow = true;
+        }
+    }
+    if (!renderNow) {
+        response.sendRedirect(uri);
+        return;
+    }
+}
+
+if (!authed && request.getParameter("download") != null) {
+    response.sendError(401, "Not authenticated");
+    return;
+}
+
+if (authed && "GET".equals(method)) {
+    String dl = request.getParameter("download");
+    if (dl != null && !dl.isEmpty()) {
+        try {
+            Path p = resolve(root, dl);
+            if (!Files.isRegularFile(p)) { response.sendError(404, "Not a file"); return; }
+            response.reset();
+            response.setContentType("application/octet-stream");
+            String fname = p.getFileName().toString();
+            response.setHeader("Content-Disposition",
+                "attachment; filename*=UTF-8''" + enc(fname));
+            response.setContentLengthLong(Files.size(p));
+            OutputStream os = response.getOutputStream();
+            Files.copy(p, os);
+            os.flush();
+            audit(request, "DOWNLOAD", dl, "ok");
+            return;
+        } catch (Exception e) {
+            response.sendError(400, e.getMessage());
+            return;
+        }
+    }
+}
+
+String rel = navPath;
+Path cur = root;
+String listErr = null;
+List<Path> items = new ArrayList<Path>();
+String sort = navSort;
+
+if (authed) {
+    try {
+        cur = resolve(root, rel);
+        if (!Files.isDirectory(cur)) cur = root;
+        rel = root.relativize(cur).toString().replace('\\', '/');
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(cur)) {
+            for (Path p : ds) items.add(p);
+        }
+        Comparator<Path> base;
+        if ("size".equals(sort)) {
+            base = new Comparator<Path>() {
+                public int compare(Path a, Path b) { return Long.compare(sizeOf(a), sizeOf(b)); }
+            };
+        } else if ("date".equals(sort)) {
+            base = new Comparator<Path>() {
+                public int compare(Path a, Path b) { return Long.compare(mtimeOf(a), mtimeOf(b)); }
+            };
+        } else {
+            base = new Comparator<Path>() {
+                public int compare(Path a, Path b) {
+                    return String.CASE_INSENSITIVE_ORDER.compare(a.getFileName().toString(), b.getFileName().toString());
+                }
+            };
+        }
+        items.sort(new Comparator<Path>() {
+            public int compare(Path a, Path b) {
+                int d = Boolean.compare(Files.isDirectory(b), Files.isDirectory(a));
+                return d != 0 ? d : base.compare(a, b);
+            }
+        });
+    } catch (Exception e) {
+        listErr = e.getMessage();
+        cur = root;
+        rel = "";
+    }
+}
+
+String viewRel = authed ? navView : null;
+String viewContent = null, viewErr = null;
+if (viewRel != null && listErr == null) {
+    try {
+        Path vp = resolve(root, viewRel);
+        if (!Files.isRegularFile(vp)) viewErr = "Not a file.";
+        else if (Files.size(vp) > MAX_TEXT) viewErr = "Too large to edit (max 1 MB).";
+        else viewContent = new String(Files.readAllBytes(vp), StandardCharsets.UTF_8);
+    } catch (Exception e) { viewErr = e.getMessage(); }
+}
+
+String CSS =
+"*{box-sizing:border-box}body{margin:0;background:#0f1419;color:#d8dee7;font:14px/1.5 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}" +
+"a{color:#7aa2f7;text-decoration:none}a:hover{text-decoration:underline}" +
+".wrap{max-width:1080px;margin:0 auto;padding:16px}" +
+".login{max-width:360px;margin:12vh auto;background:#161c24;border:1px solid #26303c;border-radius:10px;padding:28px}" +
+"h1{font-size:18px;margin:0}" +
+".muted{color:#8b98a9;font-size:12px}" +
+"input[type=password],input[type=text],textarea{width:100%;background:#0c1117;border:1px solid #2a3542;color:#d8dee7;border-radius:6px;padding:9px 12px;font:inherit;outline:none}" +
+"textarea{font:13px/1.5 ui-monospace,Consolas,monospace;min-height:420px;resize:vertical;white-space:pre}" +
+"input:focus,textarea:focus{border-color:#7aa2f7}" +
+".btn{display:inline-block;background:#1c2530;color:#d8dee7;border:1px solid #2e3a49;border-radius:6px;padding:8px 14px;font:inherit;cursor:pointer;text-decoration:none}" +
+".btn:hover{background:#233042;text-decoration:none}" +
+".btn.primary{background:#2f6fed;border-color:#2f6fed;color:#fff}" +
+".btn.primary:hover{background:#3d7bff}" +
+".btn.danger:hover{background:#5a2430;border-color:#8b3a4c}" +
+".btn.small{padding:4px 10px;font-size:12px}" +
+".toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:14px 0}" +
+".kv{display:flex;gap:8px;align-items:center}" +
+".crumbs{display:flex;gap:6px;flex-wrap:wrap;align-items:center;background:#161c24;border:1px solid #26303c;border-radius:8px;padding:8px 12px;margin-top:14px}" +
+".cf{display:inline;margin:0}" +
+".clink{background:none;border:none;color:#7aa2f7;cursor:pointer;padding:0;font:inherit;text-align:left;word-break:break-all}" +
+".clink:hover{text-decoration:underline}" +
+".clink.act{font-size:12px;margin-right:10px}" +
+"table{width:100%;border-collapse:collapse;background:#161c24;border:1px solid #26303c;border-radius:8px;overflow:hidden}" +
+"th,td{text-align:left;padding:8px 12px;border-bottom:1px solid #1f2936;vertical-align:middle}" +
+"th{background:#1a2230;color:#9fb0c3;font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.4px}" +
+"tr:last-child td{border-bottom:none}" +
+"tr:hover td{background:#1a2230}" +
+".flash{padding:10px 14px;border-radius:8px;margin:10px 0}" +
+".flash.ok{background:#12261a;border:1px solid #2c5a3a;color:#7ee2a0}" +
+".flash.err{background:#2a151b;border:1px solid #6b2f3f;color:#ff9aa8}" +
+".perm{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#8b98a9}" +
+".empty{padding:40px;text-align:center;color:#8b98a9}" +
+".topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:4px}" +
+".nowrap{white-space:nowrap}" +
+"input[type=file]{color:#8b98a9;font-size:13px}";
+
+out.print("<!DOCTYPE html>\n<html lang='en'>\n<head>\n<meta charset='utf-8'>\n<meta name='viewport' content='width=device-width, initial-scale=1'>\n<title>FM</title>\n<style>\n" + CSS + "\n</style>\n</head>\n<body>\n");
+
+if (!authed) {
+    out.print("<div class='wrap'><div class='login'><h1>File Manager</h1>");
+    out.print("<p class='muted' style='margin:6px 0 16px'>Enter the shared password.</p>");
+    if (flashErr != null) out.print("<div class='flash err'>" + esc(flashErr) + "</div>");
+    out.print("<form method='post' action='" + esc(uri) + "'>");
+    out.print("<input type='hidden' name='action' value='login'><input type='hidden' name='fm_csrf' value='" + csrf + "'>");
+    out.print("<p><input type='password' name='password' placeholder='Password' autofocus='autofocus'></p>");
+    out.print("<p style='margin-top:14px'><button class='btn primary' type='submit'>Sign in</button></p>");
+    out.print("</form></div></div>");
+} else {
+    out.print("<div class='wrap'>");
+    out.print("<div class='topbar'><h1>File Manager</h1>");
+    out.print("<form method='post' action='" + esc(uri) + "'><input type='hidden' name='action' value='logout'><input type='hidden' name='fm_csrf' value='" + csrf + "'><button class='btn small' type='submit'>Logout</button></form></div>");
+
+    if (flashMsg != null) out.print("<div class='flash ok'>" + esc(flashMsg) + "</div>");
+    if (flashErr != null) out.print("<div class='flash err'>" + esc(flashErr) + "</div>");
+
+    String absRoot = root.toString();
+
+    StringBuilder crumbs = new StringBuilder();
+    crumbs.append("<form class='cf' method='post' action='").append(esc(uri)).append("'>")
+          .append("<input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='").append(csrf).append("'>")
+          .append("<button class='clink' type='submit' title='").append(esc(absRoot)).append("'>").append(esc(absRoot)).append("</button></form>");
+    String acc = "";
+    if (rel != null && !rel.isEmpty()) {
+        for (String seg : rel.split("/")) {
+            acc = acc.isEmpty() ? seg : acc + "/" + seg;
+            crumbs.append("<span class='muted'>/</span>");
+            crumbs.append("<form class='cf' method='post' action='").append(esc(uri)).append("'>")
+                  .append("<input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='").append(csrf).append("'>")
+                  .append("<input type='hidden' name='path' value='").append(esc(acc)).append("'>")
+                  .append("<button class='clink' type='submit' title='").append(esc(absRoot + "/" + acc)).append("'>").append(esc(seg)).append("</button></form>");
+        }
+    }
+    out.print("<div class='crumbs'>" + crumbs.toString()
+            + "<span style='flex:1'></span>"
+            + "<button class='btn small' type='button' id='cp-btn' onclick='cpy()'>Copy path</button></div>");
+
+    if (viewRel != null && viewErr == null) {
+        out.print("<div class='editor-bar toolbar'><span class='muted'>Editing: " + esc(absRoot + "/" + viewRel) + "</span>");
+        out.print("<form class='cf' method='post' action='" + esc(uri) + "'><input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='" + csrf + "'><input type='hidden' name='path' value='" + esc(rel) + "'><button class='clink' type='submit'>Back</button></form></div>");
+        out.print("<form method='post' action='" + esc(uri) + "'>");
+        out.print("<input type='hidden' name='action' value='save'>");
+        out.print("<input type='hidden' name='path' value='" + esc(viewRel) + "'>");
+        out.print("<input type='hidden' name='fm_csrf' value='" + csrf + "'>");
+        out.print("<textarea name='content'>" + esc(viewContent) + "</textarea>");
+        out.print("<p style='margin-top:10px'><button class='btn primary' type='submit'>Save</button></p>");
+        out.print("</form>");
+        out.print("<form class='cf' method='post' action='" + esc(uri) + "'><input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='" + csrf + "'><input type='hidden' name='path' value='" + esc(rel) + "'><button class='btn' type='submit'>Cancel</button></form>");
+    } else {
+        if (viewErr != null) out.print("<div class='flash err'>" + esc(viewErr) + "</div>");
+        out.print("<div class='toolbar'>");
+        out.print("<form class='kv' method='post' action='" + esc(uri) + "' onsubmit='return mks()'>");
+        out.print("<input type='hidden' name='action' value='mkdir'><input type='hidden' name='fm_csrf' value='" + csrf + "'><input type='hidden' name='path' id='mk-path' value=''>");
+        out.print("<input type='text' id='mk-name' placeholder='new-folder' style='width:170px'>");
+        out.print("<button class='btn' type='submit'>New folder</button></form>");
+        out.print("<form class='kv' method='post' enctype='multipart/form-data' action='" + esc(uri) + "'>");
+        out.print("<input type='hidden' name='action' value='upload'><input type='hidden' name='fm_csrf' value='" + csrf + "'><input type='hidden' name='dest' value='" + esc(rel == null ? "" : rel) + "'>");
+        out.print("<input type='file' name='files' multiple='multiple'>");
+        out.print("<button class='btn' type='submit'>Upload</button></form>");
+        out.print("</div>");
+
+        if (listErr != null) {
+            out.print("<div class='flash err'>" + esc(listErr) + "</div>");
+        } else {
+            String sortFormName = "<form class='cf' method='post' action='" + esc(uri) + "'><input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='" + csrf + "'><input type='hidden' name='sort' value='name'><input type='hidden' name='path' value='" + esc(rel) + "'><button class='clink' type='submit'>Name</button></form>";
+            String sortFormSize = "<form class='cf' method='post' action='" + esc(uri) + "'><input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='" + csrf + "'><input type='hidden' name='sort' value='size'><input type='hidden' name='path' value='" + esc(rel) + "'><button class='clink' type='submit'>Size</button></form>";
+            String sortFormDate = "<form class='cf' method='post' action='" + esc(uri) + "'><input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='" + csrf + "'><input type='hidden' name='sort' value='date'><input type='hidden' name='path' value='" + esc(rel) + "'><button class='clink' type='submit'>Modified</button></form>";
+            out.print("<table><thead><tr>");
+            out.print("<th style='width:44%'>" + sortFormName + "</th>");
+            out.print("<th>" + sortFormSize + "</th>");
+            out.print("<th>" + sortFormDate + "</th>");
+            out.print("<th>Perms</th><th>Type</th><th style='width:200px'>Actions</th></tr></thead><tbody>");
+            if (items.isEmpty()) {
+                out.print("<tr><td colspan='6' class='empty'>Empty</td></tr>");
+            } else {
+                for (Path p : items) {
+                    String name = p.getFileName().toString();
+                    boolean dir = Files.isDirectory(p);
+                    String childRel = (rel == null || rel.isEmpty()) ? name : rel + "/" + name;
+                    out.print("<tr>");
+                    out.print("<td>");
+                    out.print("<form class='cf' method='post' action='" + esc(uri) + "'>");
+                    out.print("<input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='" + csrf + "'><input type='hidden' name='path' value='" + esc(childRel) + "'>");
+                    out.print("<button class='clink' type='submit'>" + (dir ? "&#128193;" : "&#128196;") + " " + esc(name) + "</button></form>");
+                    out.print("</td>");
+                    out.print("<td class='muted'>" + (dir ? "" : fmtSize(sizeOf(p))) + "</td>");
+                    out.print("<td class='muted'>" + fmtDate(mtimeOf(p)) + "</td>");
+                    out.print("<td class='perm'>" + perms(p) + "</td>");
+                    out.print("<td class='muted'>" + (dir ? "dir" : "file") + "</td>");
+                    out.print("<td class='nowrap'>");
+                    if (!dir) {
+                        out.print("<form class='cf' method='post' action='" + esc(uri) + "'><input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='" + csrf + "'><input type='hidden' name='path' value='" + esc(childRel) + "'><button class='clink act' type='submit'>Edit</button></form>");
+                        out.print("<form class='cf' method='post' action='" + esc(uri) + "'><input type='hidden' name='action' value='download'><input type='hidden' name='fm_csrf' value='" + csrf + "'><input type='hidden' name='path' value='" + esc(childRel) + "'><button class='clink act' type='submit'>DL</button></form>");
+                    }
+                    out.print("<button class='btn small' type='button' onclick='rn(\"" + escJs(name) + "\")'>Rename</button> ");
+                    out.print("<form class='cf' method='post' action='" + esc(uri) + "' onsubmit=\"return confirm('Delete " + escJs(name) + "?')\">");
+                    out.print("<input type='hidden' name='action' value='delete'><input type='hidden' name='fm_csrf' value='" + csrf + "'><input type='hidden' name='path' value='" + esc(childRel) + "'>");
+                    out.print("<button class='btn small danger' type='submit'>Del</button></form>");
+                    out.print("</td></tr>");
+                }
+            }
+            out.print("</tbody></table>");
+        }
+        out.print("<form id='rn-form' method='post' action='" + esc(uri) + "'>");
+        out.print("<input type='hidden' name='action' value='rename'><input type='hidden' name='fm_csrf' value='" + csrf + "'>");
+        out.print("<input type='hidden' name='path' id='rn-path'><input type='hidden' name='to' id='rn-to'></form>");
+    }
+    out.print("<script>" +
+        "function mks(){var v=document.getElementById('mk-name').value.trim();if(!v)return false;var c='" + escJs(rel) + "';document.getElementById('mk-path').value=(c?c+'/':'')+v;return true}" +
+        "function rn(n){var c='" + escJs(rel) + "';var v=prompt('New name:',n);if(v&&v!==n){document.getElementById('rn-path').value=(c?c+'/':'')+n;document.getElementById('rn-to').value=(c?c+'/':'')+v;document.getElementById('rn-form').submit()}}" +
+        "function cpy(){var t='" + escJs(absRoot + (rel == null || rel.isEmpty() ? "" : "/" + rel)) + "';if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t);var b=document.getElementById('cp-btn');b.textContent='Copied';setTimeout(function(){b.textContent='Copy path'},1500)}else{prompt('Path:',t)}}" +
+        "setTimeout(function(){var f=document.querySelector('.flash');if(f)f.style.display='none'},4000)" +
+        "if(window.history&&window.history.replaceState){try{window.history.replaceState(null,'','" + escJs(uri) + "')}catch(e){}}" +
+        "</script>");
+    out.print("</div>");
+}
+out.print("</body>\n</html>");
+]]></jsp:scriptlet>
+</jsp:root>
