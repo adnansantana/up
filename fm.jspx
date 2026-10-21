@@ -110,26 +110,26 @@ private static Map<String, String> parseQuery(String q) {
     return m;
 }
 
-private static Path resolve(Path root, String rel) throws IOException {
-    if (rel == null || rel.trim().isEmpty()) return root;
-    Path p = root.resolve(rel.replace('\\', '/')).normalize();
-    if (!p.startsWith(root)) throw new IOException("Outside root");
-    if (Files.exists(p)) {
-        p = p.toRealPath();
-        if (!p.startsWith(root)) throw new IOException("Symlink escapes root");
+private static Path resolve(Path base, String rel) throws IOException {
+    if (rel == null || rel.trim().isEmpty()) return base;
+    Path p;
+    if (rel.startsWith("/")) {
+        p = Paths.get(rel).normalize();
     } else {
-        Path parent = p.getParent();
-        if (parent == null || !Files.exists(parent)) throw new IOException("Parent does not exist");
-        parent = parent.toRealPath();
-        if (!parent.startsWith(root)) throw new IOException("Symlink escapes root");
+        p = base.resolve(rel.replace('\\', '/')).normalize();
     }
-    return p;
+    if (Files.exists(p)) return p.toRealPath();
+    Path parent = p.getParent();
+    if (parent == null || !Files.exists(parent)) throw new IOException("Parent does not exist");
+    parent = parent.toRealPath();
+    return parent.resolve(p.getFileName());
 }
 
 private static String parentRel(String rel) {
     if (rel == null || rel.isEmpty()) return "";
+    if ("/".equals(rel)) return "/";
     int i = rel.lastIndexOf('/');
-    return i < 0 ? "" : rel.substring(0, i);
+    return i <= 0 ? "/" : rel.substring(0, i);
 }
 
 private static long sizeOf(Path p) {
@@ -166,6 +166,46 @@ private static String perms(Path p) {
         sb.append(Files.isExecutable(p) ? 'x' : '-');
         return sb.toString();
     }
+}
+
+private static String crumbHtml(String uri, String csrf, String label, String navRel, Path dirPath) {
+    StringBuilder sb = new StringBuilder();
+    List<Path> kids = new ArrayList<Path>();
+    if (dirPath != null && Files.isDirectory(dirPath)) {
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(dirPath)) {
+            for (Path p : ds) if (Files.isDirectory(p)) kids.add(p);
+        } catch (Exception e) { /* ignore */ }
+        kids.sort(new Comparator<Path>() {
+            public int compare(Path a, Path b) {
+                return String.CASE_INSENSITIVE_ORDER.compare(a.getFileName().toString(), b.getFileName().toString());
+            }
+        });
+    }
+    sb.append("<div class='crumb'>");
+    sb.append("<form class='cf' method='post' action='").append(esc(uri)).append("'>");
+    sb.append("<input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='").append(csrf).append("'>");
+    if (navRel != null && !navRel.isEmpty()) {
+        sb.append("<input type='hidden' name='path' value='").append(esc(navRel)).append("'>");
+    }
+    sb.append("<button class='clink' type='submit' title='").append(esc(label)).append("'>").append(esc(label));
+    if (!kids.isEmpty()) sb.append(" &#9662;");
+    sb.append("</button></form>");
+    sb.append("<div class='drop'>");
+    if (kids.isEmpty()) {
+        sb.append("<span class='muted drop-empty'>no subfolders</span>");
+    } else {
+        for (Path k : kids) {
+            String name = k.getFileName().toString();
+            String kRel = (navRel == null || navRel.isEmpty()) ? name
+                    : (navRel.endsWith("/") ? navRel + name : navRel + "/" + name);
+            sb.append("<form class='cf' method='post' action='").append(esc(uri)).append("'>");
+            sb.append("<input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='").append(csrf).append("'>");
+            sb.append("<input type='hidden' name='path' value='").append(esc(kRel)).append("'>");
+            sb.append("<button class='clink' type='submit'>&#128193; ").append(esc(name)).append("</button></form>");
+        }
+    }
+    sb.append("</div></div>");
+    return sb.toString();
 }
 
 private static void deleteRecursive(Path p) throws IOException {
@@ -378,11 +418,11 @@ if ("POST".equals(method)) {
                     try {
                         Path t = resolve(root, navPath);
                         if (Files.isRegularFile(t)) {
-                            navView = root.relativize(t).toString().replace('\\', '/');
+                            navView = t.toString().replace('\\', '/');
                             Path parent = t.getParent();
-                            navPath = parent == null ? "" : root.relativize(parent).toString().replace('\\', '/');
+                            navPath = parent == null ? "" : parent.toString().replace('\\', '/');
                         } else if (Files.isDirectory(t)) {
-                            navPath = root.relativize(t).toString().replace('\\', '/');
+                            navPath = t.toString().replace('\\', '/');
                         }
                     } catch (Exception e) { /* render will show the error */ }
                 }
@@ -545,7 +585,7 @@ if (authed) {
     try {
         cur = resolve(root, rel);
         if (!Files.isDirectory(cur)) cur = root;
-        rel = root.relativize(cur).toString().replace('\\', '/');
+        rel = cur.toString().replace('\\', '/');
         try (DirectoryStream<Path> ds = Files.newDirectoryStream(cur)) {
             for (Path p : ds) items.add(p);
         }
@@ -574,7 +614,7 @@ if (authed) {
     } catch (Exception e) {
         listErr = e.getMessage();
         cur = root;
-        rel = "";
+        rel = root.toString().replace('\\', '/');
     }
 }
 
@@ -609,6 +649,12 @@ String CSS =
 ".kv{display:flex;gap:8px;align-items:center}" +
 ".crumbs{display:flex;gap:6px;flex-wrap:wrap;align-items:center;background:#161c24;border:1px solid #26303c;border-radius:8px;padding:8px 12px;margin-top:14px}" +
 ".cf{display:inline;margin:0}" +
+".crumb{position:relative;display:inline-flex;align-items:center}" +
+".drop{display:none;position:absolute;top:100%;left:0;z-index:50;background:#161c24;border:1px solid #2e3a49;border-radius:8px;min-width:220px;max-width:400px;max-height:320px;overflow:auto;padding:6px;margin-top:4px;box-shadow:0 8px 24px rgba(0,0,0,.4)}" +
+".crumb:hover .drop{display:block}" +
+".drop .clink{display:block;width:100%;padding:4px 8px;border-radius:4px;color:#d8dee7;word-break:break-all;white-space:normal}" +
+".drop .clink:hover{background:#1a2230;color:#7aa2f7;text-decoration:none}" +
+".drop-empty{padding:4px 8px}" +
 ".clink{background:none;border:none;color:#7aa2f7;cursor:pointer;padding:0;font:inherit;text-align:left;word-break:break-all}" +
 ".clink:hover{text-decoration:underline}" +
 ".clink.act{font-size:12px;margin-right:10px}" +
@@ -645,21 +691,15 @@ if (!authed) {
     if (flashMsg != null) out.print("<div class='flash ok'>" + esc(flashMsg) + "</div>");
     if (flashErr != null) out.print("<div class='flash err'>" + esc(flashErr) + "</div>");
 
-    String absRoot = root.toString();
-
     StringBuilder crumbs = new StringBuilder();
-    crumbs.append("<form class='cf' method='post' action='").append(esc(uri)).append("'>")
-          .append("<input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='").append(csrf).append("'>")
-          .append("<button class='clink' type='submit' title='").append(esc(absRoot)).append("'>").append(esc(absRoot)).append("</button></form>");
-    String acc = "";
-    if (rel != null && !rel.isEmpty()) {
+    crumbs.append(crumbHtml(uri, csrf, "/", "/", Paths.get("/")));
+    if (rel != null && !rel.isEmpty() && !"/".equals(rel)) {
+        String acc = "";
         for (String seg : rel.split("/")) {
-            acc = acc.isEmpty() ? seg : acc + "/" + seg;
+            if (seg.isEmpty()) continue;
+            acc = acc.isEmpty() ? "/" + seg : acc + "/" + seg;
             crumbs.append("<span class='muted'>/</span>");
-            crumbs.append("<form class='cf' method='post' action='").append(esc(uri)).append("'>")
-                  .append("<input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='").append(csrf).append("'>")
-                  .append("<input type='hidden' name='path' value='").append(esc(acc)).append("'>")
-                  .append("<button class='clink' type='submit' title='").append(esc(absRoot + "/" + acc)).append("'>").append(esc(seg)).append("</button></form>");
+            crumbs.append(crumbHtml(uri, csrf, seg, acc, Paths.get(acc)));
         }
     }
     out.print("<div class='crumbs'>" + crumbs.toString()
@@ -667,7 +707,7 @@ if (!authed) {
             + "<button class='btn small' type='button' id='cp-btn' onclick='cpy()'>Copy path</button></div>");
 
     if (viewRel != null && viewErr == null) {
-        out.print("<div class='editor-bar toolbar'><span class='muted'>Editing: " + esc(absRoot + "/" + viewRel) + "</span>");
+        out.print("<div class='editor-bar toolbar'><span class='muted'>Editing: " + esc(viewRel) + "</span>");
         out.print("<form class='cf' method='post' action='" + esc(uri) + "'><input type='hidden' name='action' value='navigate'><input type='hidden' name='fm_csrf' value='" + csrf + "'><input type='hidden' name='path' value='" + esc(rel) + "'><button class='clink' type='submit'>Back</button></form></div>");
         out.print("<form method='post' action='" + esc(uri) + "'>");
         out.print("<input type='hidden' name='action' value='save'>");
@@ -707,7 +747,7 @@ if (!authed) {
                 for (Path p : items) {
                     String name = p.getFileName().toString();
                     boolean dir = Files.isDirectory(p);
-                    String childRel = (rel == null || rel.isEmpty()) ? name : rel + "/" + name;
+                    String childRel = ("/".equals(rel) || rel == null || rel.isEmpty()) ? "/" + name : rel + "/" + name;
                     out.print("<tr>");
                     out.print("<td>");
                     out.print("<form class='cf' method='post' action='" + esc(uri) + "'>");
@@ -737,9 +777,9 @@ if (!authed) {
         out.print("<input type='hidden' name='path' id='rn-path'><input type='hidden' name='to' id='rn-to'></form>");
     }
     out.print("<script>" +
-        "function mks(){var v=document.getElementById('mk-name').value.trim();if(!v)return false;var c='" + escJs(rel) + "';document.getElementById('mk-path').value=(c?c+'/':'')+v;return true}" +
-        "function rn(n){var c='" + escJs(rel) + "';var v=prompt('New name:',n);if(v&&v!==n){document.getElementById('rn-path').value=(c?c+'/':'')+n;document.getElementById('rn-to').value=(c?c+'/':'')+v;document.getElementById('rn-form').submit()}}" +
-        "function cpy(){var t='" + escJs(absRoot + (rel == null || rel.isEmpty() ? "" : "/" + rel)) + "';if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t);var b=document.getElementById('cp-btn');b.textContent='Copied';setTimeout(function(){b.textContent='Copy path'},1500)}else{prompt('Path:',t)}}" +
+        "function mks(){var v=document.getElementById('mk-name').value.trim();if(!v)return false;var c='" + escJs(rel) + "';document.getElementById('mk-path').value=(c=='/'?'':c)+'/'+v;return true}" +
+        "function rn(n){var c='" + escJs(rel) + "';var v=prompt('New name:',n);if(v&&v!==n){document.getElementById('rn-path').value=(c=='/'?'':c)+'/'+n;document.getElementById('rn-to').value=(c=='/'?'':c)+'/'+v;document.getElementById('rn-form').submit()}}" +
+        "function cpy(){var t='" + escJs(rel) + "';if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t);var b=document.getElementById('cp-btn');b.textContent='Copied';setTimeout(function(){b.textContent='Copy path'},1500)}else{prompt('Path:',t)}}" +
         "setTimeout(function(){var f=document.querySelector('.flash');if(f)f.style.display='none'},4000)" +
         "if(window.history&&window.history.replaceState){try{window.history.replaceState(null,'','" + escJs(uri) + "')}catch(e){}}" +
         "</script>");
